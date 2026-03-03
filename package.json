@@ -1,0 +1,21 @@
+{
+  "name": "simply-bot-mendoza",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@antiadmin/anticaptchaofficial": "^1.0.55",
+    "axios": "^1.13.5",
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "node-fetch": "^2.7.0",
+    "puppeteer": "^24.37.5"
+  }
+}
