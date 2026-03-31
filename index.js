@@ -584,6 +584,8 @@ app.post('/api/simular-cupo', async (req, res) => {
         paso = 'Buscar DNI';
         const { grillaHtml, grillaFrame } = await buscarDNI(page, dniFrame, dniSelector, dniLimpio);
         console.log(`[BUSCAR] Grilla: ${grillaHtml.length}c`);
+        // DEBUG: primeros 4000 chars de la grilla
+        console.log(`[GRILLA RAW] ${grillaHtml.substring(0, 4000)}`);
 
         if (!grillaHtml || grillaHtml.length < 100)
             { await browser.close(); return res.json({ success: false, error: true, mensaje: 'Grilla vacía' }); }
