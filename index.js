@@ -158,18 +158,24 @@ async function intentarLogin(page, browser, usuario, password) {
 
 // ── Tab Personas + input DNI ──────────────────────────────────
 async function irAPersonas(page) {
+    console.log(`[PERSONAS] frames antes Tab_Click: ${page.frames().map(f => f.name()+'='+f.url().split('/').pop()).join(', ')}`);
     await page.evaluate(() => { try { Tab_Click('Personas'); } catch(e) {} });
     await sleep(8000);
+    console.log(`[PERSONAS] frames post Tab_Click: ${page.frames().map(f => f.name()+'='+f.url().split('/').pop()).join(', ')}`);
     const selectors = ['input[name="Per_NroDoc"]', 'input[name="dni"]', 'input[name="Documento"]'];
     let dniFrame = null, dniSelector = null;
     const iPersonas = page.frames().find(f => f.name() === 'iPersonas');
+    console.log(`[PERSONAS] iPersonas: ${iPersonas ? iPersonas.url() : 'NO'}`);
     if (iPersonas) {
+        const ipHtml = await iPersonas.content().catch(() => '');
+        console.log(`[PERSONAS] iPersonas html (500c): ${ipHtml.substring(0, 500)}`);
         for (const sel of selectors) {
             if (await iPersonas.$(sel).catch(() => null)) { dniFrame = iPersonas; dniSelector = sel; break; }
         }
     }
     if (!dniFrame) {
-        for (let i = 0; i < 5 && !dniFrame; i++) {
+        for (let i = 0; i < 3 && !dniFrame; i++) {
+            console.log(`[PERSONAS] intento ${i+1} buscando input DNI...`);
             for (const f of page.frames()) {
                 for (const sel of selectors) {
                     if (await f.$(sel).catch(() => null)) { dniFrame = f; dniSelector = sel; break; }
@@ -179,6 +185,7 @@ async function irAPersonas(page) {
             if (!dniFrame) await sleep(3000);
         }
     }
+    console.log(`[PERSONAS] resultado: dniFrame=${dniFrame ? dniFrame.name() : 'NO'} selector=${dniSelector}`);
     return { dniFrame, dniSelector };
 }
 
