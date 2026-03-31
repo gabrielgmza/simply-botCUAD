@@ -93,12 +93,7 @@ async function resolverCaptcha(bmpBuffer, browser) {
     return null;
 }
 
-// ============================================================
-// Intento completo de login: navegar → captcha → submit → verificar
-// Retorna true si principal.asp cargó, false si captcha incorrecto
-// ============================================================
 async function intentarLogin(page, browser, usuario, password) {
-    // Capturar BMP via network
     let captchaBmp = null;
     const captchaHandler = async (resp) => {
         if (resp.url().includes('aspcaptcha.asp')) {
@@ -107,7 +102,6 @@ async function intentarLogin(page, browser, usuario, password) {
     };
     page.on('response', captchaHandler);
 
-    // Navegar a / → login.asp
     await page.goto('https://descuentos.mendoza.gov.ar/', { waitUntil: 'networkidle2' });
     await sleep(3000);
     if (page.url().includes('logout_resolucion')) throw new Error('Screen check falló');
@@ -117,22 +111,17 @@ async function intentarLogin(page, browser, usuario, password) {
             await page.goto('https://descuentos.mendoza.gov.ar/login.asp', { waitUntil: 'networkidle2' });
     }
 
-    // Esperar Modo=M
     let loginFrame = null;
     for (let i = 0; i < 20 && !loginFrame; i++) { await sleep(1500); loginFrame = page.frames().find(f => f.url().includes('Modo=M')); }
     if (!loginFrame) throw new Error('Modo=M no apareció');
 
-    // Esperar captcha
     for (let i = 0; i < 10 && !captchaBmp; i++) await sleep(500);
     page.off('response', captchaHandler);
-    console.log(`  captcha: ${captchaBmp ? captchaBmp.length + 'b' : 'NO'}`);
 
-    // Resolver captcha
     const captchaSol = await resolverCaptcha(captchaBmp, browser);
     if (!captchaSol) throw new Error('Captcha no resuelto');
     console.log(`  captcha="${captchaSol}"`);
 
-    // Llenar form
     await loginFrame.waitForSelector('#user', { timeout: 10000 });
     await loginFrame.click('#user', { clickCount: 3 }); await loginFrame.type('#user', usuario, { delay: 60 });
     await loginFrame.click('#password', { clickCount: 3 }); await loginFrame.type('#password', password, { delay: 60 });
@@ -140,7 +129,6 @@ async function intentarLogin(page, browser, usuario, password) {
     const mac = await loginFrame.$eval('#hCadMac', el => el.value).catch(() => '');
     if (!mac || mac === '0') await loginFrame.$eval('#hCadMac', (el, v) => el.value = v, String(usuario.length + password.length + 6));
 
-    // Interceptar "/" → principal.asp + Submit
     await page.setRequestInterception(true);
     let loginOk = false, interceptActive = true;
     const reqHandler = (req) => {
@@ -163,14 +151,356 @@ async function intentarLogin(page, browser, usuario, password) {
 
     if (!loginOk) throw new Error('Login no disparó "/"');
 
-    // Verificar si principal.asp cargó
     await sleep(5000);
     const html = await page.content().catch(() => '');
-    const hasSystem = html.includes('Tab_Registra');
-    const ctk = (await page.cookies()).find(c => c.name === 'ctk')?.value || '?';
-    console.log(`  resultado: hasSystem=${hasSystem} ctk=${ctk} url=${page.url()}`);
+    return html.includes('Tab_Registra');
+}
 
-    return hasSystem;
+// ── Tab Personas + input DNI ──────────────────────────────────
+async function irAPersonas(page) {
+    await page.evaluate(() => { try { Tab_Click('Personas'); } catch(e) {} });
+    await sleep(8000);
+    const selectors = ['input[name="Per_NroDoc"]', 'input[name="dni"]', 'input[name="Documento"]'];
+    let dniFrame = null, dniSelector = null;
+    const iPersonas = page.frames().find(f => f.name() === 'iPersonas');
+    if (iPersonas) {
+        for (const sel of selectors) {
+            if (await iPersonas.$(sel).catch(() => null)) { dniFrame = iPersonas; dniSelector = sel; break; }
+        }
+    }
+    if (!dniFrame) {
+        for (let i = 0; i < 5 && !dniFrame; i++) {
+            for (const f of page.frames()) {
+                for (const sel of selectors) {
+                    if (await f.$(sel).catch(() => null)) { dniFrame = f; dniSelector = sel; break; }
+                }
+                if (dniFrame) break;
+            }
+            if (!dniFrame) await sleep(3000);
+        }
+    }
+    return { dniFrame, dniSelector };
+}
+
+// ── Buscar DNI y retornar grilla ──────────────────────────────
+async function buscarDNI(page, dniFrame, dniSelector, dniLimpio) {
+    await dniFrame.evaluate((sel) => { const el = document.querySelector(sel); if (el) { el.value = ''; el.focus(); } }, dniSelector);
+    await dniFrame.type(dniSelector, dniLimpio, { delay: 50 });
+    await dniFrame.evaluate(() => {
+        try {
+            if (typeof Buscar === 'function') { Buscar(); return; }
+            if (typeof Aceptar === 'function') { Aceptar(); return; }
+            const form = document.getElementById('form1') || document.forms[0];
+            if (form) { const modo = document.getElementById('Modo'); if (modo) modo.value = 'Buscar'; form.submit(); }
+        } catch(e) {}
+    });
+    await sleep(8000);
+    let grillaHtml = '';
+    const grillaFrame = page.frames().find(f => f.name() === 'ifrGrillaPersonas');
+    if (grillaFrame) grillaHtml = await grillaFrame.content().catch(() => '');
+    if (!grillaHtml) grillaHtml = await page.evaluate(() => document.body?.innerHTML || '').catch(() => '');
+    return { grillaHtml, grillaFrame };
+}
+
+// ── Parsear grilla — detecta si Socio=SI/NO ───────────────────
+// Retorna array de { index, nombre, esSocio, sexoCelda }
+function parsearGrilla(html) {
+    const filas = [];
+    const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+    let match, idx = 0;
+    while ((match = rowRegex.exec(html)) !== null) {
+        const row = match[0];
+        if (row.toLowerCase().includes('<th')) continue;
+        const cells = (row.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || [])
+            .map(c => c.replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').trim());
+        if (cells.length < 2) continue;
+        const nombre = cells.find(c => c.length > 3 && /[a-zA-ZáéíóúÁÉÍÓÚñÑ]/.test(c)) || '';
+        const sexoCelda = cells.find(c => c === 'M' || c === 'F') || '';
+        // Columna Socio: "SI" o "NO" — suele ser la última o penúltima
+        const esSocio = cells.some(c => c.trim().toUpperCase() === 'SI');
+        if (nombre) { filas.push({ index: idx, nombre, sexoCelda, esSocio, cells }); idx++; }
+    }
+    return filas;
+}
+
+// ── Abrir Propiedades del legajo (click derecho → Propiedades) ─
+async function abrirPropiedades(page, grillaFrame, rowIndex) {
+    const frame = grillaFrame || page;
+    // Hacer click derecho en la fila para abrir menu contextual
+    await frame.evaluate((idx) => {
+        const rows = Array.from(document.querySelectorAll('tr')).filter(r =>
+            !r.querySelector('th') && r.querySelectorAll('td').length >= 2);
+        if (!rows[idx]) return;
+        rows[idx].dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2 }));
+    }, rowIndex);
+    await sleep(2000);
+
+    // Buscar y clickear "Propiedades" en el menú contextual (en cualquier frame)
+    for (const f of page.frames()) {
+        const clicked = await f.evaluate(() => {
+            // Menú contextual puede ser un <div> o <ul> con opciones
+            const items = Array.from(document.querySelectorAll('a, li, div, span, td'));
+            const prop = items.find(el => /propiedades/i.test(el.innerText || el.textContent || ''));
+            if (prop) { prop.click(); return true; }
+            return false;
+        }).catch(() => false);
+        if (clicked) break;
+    }
+
+    // Alternativa: buscar botón "Propiedades" directo en la página (algunos portales lo muestran así)
+    for (const f of page.frames()) {
+        const clicked = await f.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('input[type="button"], button'));
+            const btn = btns.find(b => /propiedades/i.test(b.value || b.innerText || ''));
+            if (btn) { btn.click(); return true; }
+            return false;
+        }).catch(() => false);
+        if (clicked) break;
+    }
+
+    await sleep(3000);
+}
+
+// ── Afiliar persona: pestaña Afiliado → Alta Afiliado → Adherente B / ACT ──
+// Retorna true si afiliación exitosa
+async function afiliarPersona(page) {
+    // Hacer click en pestaña "Afiliado"
+    for (const f of page.frames()) {
+        const clicked = await f.evaluate(() => {
+            const tabs = Array.from(document.querySelectorAll('a, span, div, td, li'));
+            const tab = tabs.find(el => /^afiliado$/i.test((el.innerText || el.textContent || '').trim()));
+            if (tab) { tab.click(); return true; }
+            return false;
+        }).catch(() => false);
+        if (clicked) { await sleep(2000); break; }
+    }
+
+    // Click en "Alta Afiliado"
+    for (const f of page.frames()) {
+        const clicked = await f.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('input[type="button"], button, a'));
+            const btn = btns.find(b => /alta\s*afiliado/i.test(b.value || b.innerText || b.textContent || ''));
+            if (btn) { btn.click(); return true; }
+            return false;
+        }).catch(() => false);
+        if (clicked) { await sleep(3000); break; }
+    }
+
+    // Seleccionar categoría: preferir "Adherente B", si no existe usar primera opción disponible
+    for (const f of page.frames()) {
+        const seleccionado = await f.evaluate(() => {
+            // Buscar select de categoría
+            const selects = Array.from(document.querySelectorAll('select'));
+            for (const sel of selects) {
+                const opts = Array.from(sel.options);
+                // Preferir Adherente B
+                const adherenteB = opts.find(o => /adherente\s*b/i.test(o.text));
+                // Si no, buscar ACT/Activo
+                const act = opts.find(o => /^act$/i.test(o.text.trim()) || /activo/i.test(o.text));
+                // Si no, tomar la última opción (generalmente la menos costosa)
+                const elegida = adherenteB || act || opts[opts.length - 1];
+                if (elegida) { sel.value = elegida.value; sel.dispatchEvent(new Event('change', { bubbles: true })); return elegida.text; }
+            }
+            // Alternativa: radio buttons con texto
+            const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
+            if (radios.length > 0) {
+                const last = radios[radios.length - 1];
+                last.checked = true; last.dispatchEvent(new Event('change', { bubbles: true }));
+                const label = document.querySelector(`label[for="${last.id}"]`);
+                return label?.innerText || 'ultima opcion';
+            }
+            return null;
+        }).catch(() => null);
+        if (seleccionado) { console.log(`[AFILIACION] Categoría elegida: ${seleccionado}`); await sleep(1000); break; }
+    }
+
+    // Click Aceptar en el modal de Alta
+    for (const f of page.frames()) {
+        const clicked = await f.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('input[type="button"], button, input[type="submit"]'));
+            const btn = btns.find(b => /^aceptar$/i.test((b.value || b.innerText || '').trim()));
+            if (btn) { btn.click(); return true; }
+            return false;
+        }).catch(() => false);
+        if (clicked) { await sleep(3000); break; }
+    }
+
+    // Modal "¿Desea imprimir comprobante?" → click NO
+    for (let i = 0; i < 5; i++) {
+        for (const f of page.frames()) {
+            const clicked = await f.evaluate(() => {
+                const btns = Array.from(document.querySelectorAll('input[type="button"], button'));
+                const no = btns.find(b => /^no$/i.test((b.value || b.innerText || '').trim()));
+                if (no) { no.click(); return true; }
+                return false;
+            }).catch(() => false);
+            if (clicked) { await sleep(2000); break; }
+        }
+        await sleep(1000);
+    }
+
+    // Click Cerrar para volver a la grilla
+    for (const f of page.frames()) {
+        await f.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('input[type="button"], button'));
+            const cerrar = btns.find(b => /cerrar/i.test(b.value || b.innerText || ''));
+            if (cerrar) cerrar.click();
+        }).catch(() => {});
+    }
+    await sleep(3000);
+
+    console.log('[AFILIACION] ✅ Proceso de afiliación completado');
+    return true;
+}
+
+// ── Dar de baja la afiliación ─────────────────────────────────
+async function bajaAfiliado(page, grillaFrame, rowIndex) {
+    await abrirPropiedades(page, grillaFrame, rowIndex);
+
+    // Pestaña Afiliado
+    for (const f of page.frames()) {
+        const clicked = await f.evaluate(() => {
+            const tabs = Array.from(document.querySelectorAll('a, span, div, td, li'));
+            const tab = tabs.find(el => /^afiliado$/i.test((el.innerText || el.textContent || '').trim()));
+            if (tab) { tab.click(); return true; }
+            return false;
+        }).catch(() => false);
+        if (clicked) { await sleep(2000); break; }
+    }
+
+    // Click "Baja Afiliado"
+    for (const f of page.frames()) {
+        const clicked = await f.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('input[type="button"], button, a'));
+            const btn = btns.find(b => /baja\s*afiliado/i.test(b.value || b.innerText || b.textContent || ''));
+            if (btn) { btn.click(); return true; }
+            return false;
+        }).catch(() => false);
+        if (clicked) { await sleep(3000); break; }
+    }
+
+    // Confirmar Aceptar
+    for (const f of page.frames()) {
+        await f.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('input[type="button"], button'));
+            const btn = btns.find(b => /^aceptar$/i.test((b.value || b.innerText || '').trim()));
+            if (btn) btn.click();
+        }).catch(() => {});
+    }
+    await sleep(3000);
+
+    // Modal imprimir → NO
+    for (const f of page.frames()) {
+        await f.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('input[type="button"], button'));
+            const no = btns.find(b => /^no$/i.test((b.value || b.innerText || '').trim()));
+            if (no) no.click();
+        }).catch(() => {});
+    }
+    await sleep(2000);
+
+    // Cerrar
+    for (const f of page.frames()) {
+        await f.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('input[type="button"], button'));
+            const cerrar = btns.find(b => /cerrar/i.test(b.value || b.innerText || ''));
+            if (cerrar) cerrar.click();
+        }).catch(() => {});
+    }
+    await sleep(2000);
+    console.log('[BAJA AFILIADO] ✅ Completado');
+}
+
+// ── Click en legajo de la grilla ──────────────────────────────
+async function clickLegajo(page, grillaFrame, index) {
+    const frame = grillaFrame || page;
+    await frame.evaluate((idx) => {
+        const rows = Array.from(document.querySelectorAll('tr')).filter(r =>
+            !r.querySelector('th') && r.querySelectorAll('td').length >= 2);
+        if (!rows[idx]) return;
+        const link = rows[idx].querySelector('a');
+        if (link) { link.click(); return; }
+        rows[idx].click();
+    }, index);
+    await sleep(5000);
+}
+
+// ── Click Alta de crédito ─────────────────────────────────────
+async function clickAltaCredito(page) {
+    for (const f of page.frames()) {
+        const clicked = await f.evaluate(() => {
+            const btns = Array.from(document.querySelectorAll('input[type="button"], button, input[type="submit"], a'));
+            const alta = btns.find(b => /^alta$/i.test((b.value || b.innerText || '').trim()));
+            if (alta) { alta.click(); return true; }
+            return false;
+        }).catch(() => false);
+        if (clicked) { await sleep(4000); return true; }
+    }
+    return false;
+}
+
+// ── Binary search del cupo ────────────────────────────────────
+async function binarySearchCupo(page, min, max) {
+    let bajo = min, alto = max, cupoMaximo = 0, iteraciones = 0;
+
+    async function probarMonto(monto) {
+        for (const f of page.frames()) {
+            const ok = await f.evaluate((m) => {
+                const input = document.querySelector('input[name="importe_cuota"]') ||
+                              document.querySelector('input[name="monto"]') ||
+                              document.querySelector('input[name="Monto"]') ||
+                              document.querySelector('input[name="Importe"]');
+                if (!input) return false;
+                input.value = m.toString();
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                const btns = Array.from(document.querySelectorAll('input[type="button"], button'));
+                const btn = btns.find(b => /consultar|control|verificar/i.test(b.value || b.innerText || ''));
+                if (btn) { btn.click(); return true; }
+                return false;
+            }, monto).catch(() => false);
+            if (ok) { await sleep(4000); return true; }
+        }
+        return false;
+    }
+
+    async function esAprobado() {
+        for (const f of page.frames()) {
+            const result = await f.evaluate(() => {
+                const body = document.body?.innerText || '';
+                if (/aprobado|autorizado|ok|disponible|aceptado/i.test(body)) return 'ok';
+                if (/rechazado|supera|excede|no disponible|insuficiente/i.test(body)) return 'nok';
+                return 'unknown';
+            }).catch(() => 'unknown');
+            if (result !== 'unknown') return result === 'ok';
+        }
+        return false;
+    }
+
+    while (bajo <= alto && iteraciones < 12) {
+        iteraciones++;
+        const medio = Math.floor((bajo + alto) / 2);
+        console.log(`[BINARY] iter=${iteraciones} rango=[${bajo},${alto}] prueba=${medio}`);
+        if (!await probarMonto(medio)) break;
+        const aprobado = await esAprobado();
+        console.log(`[BINARY] monto=${medio} aprobado=${aprobado}`);
+        if (aprobado) { cupoMaximo = medio; bajo = medio + 1; }
+        else { alto = medio - 1; }
+    }
+
+    return { cupoMaximo, iteraciones };
+}
+
+// ============================================================
+// LOGIN HELPER
+// ============================================================
+async function loginConRetry(page, browser, usuario, password) {
+    let loggedIn = false;
+    for (let intento = 1; intento <= 3 && !loggedIn; intento++) {
+        console.log(`[LOGIN] Intento ${intento}/3...`);
+        try { loggedIn = await intentarLogin(page, browser, usuario, password); }
+        catch(e) { console.log(`[LOGIN] Error: ${e.message}`); }
+    }
+    return loggedIn;
 }
 
 // ============================================================
@@ -225,145 +555,91 @@ app.post('/api/consultar-juicios', async (req, res) => {
 });
 
 // ============================================================
-// 3. SIMULAR CUPO — v10 con retry de captcha
+// 3. SIMULAR CUPO — v12: afiliación automática si Socio=NO
 // ============================================================
 app.post('/api/simular-cupo', async (req, res) => {
-    let { dni, usuario, password, min = 1000, max = 500000 } = req.body;
+    let { dni, usuario, password, sexo, min = 1000, max = 500000 } = req.body;
     if (!dni || !usuario || !password) return res.json({ success: false, error: true, mensaje: 'Faltan: dni, usuario, password' });
     const dniLimpio = dni.length > 8 ? dni.substring(2, dni.length - 1) : dni;
     let browser, paso = 'Iniciando';
 
     try {
         console.log(`\n${'='.repeat(60)}`);
-        console.log(`[CUAD v10] DNI=${dni} user=${usuario} — ${new Date().toISOString()}`);
+        console.log(`[CUAD v12] DNI=${dniLimpio} — ${new Date().toISOString()}`);
         browser = await launchBrowser();
         const page = await browser.newPage();
         await configurarPagina(page);
 
-        // ── LOGIN CON RETRY (hasta 3 intentos por captcha incorrecto) ──
         paso = 'Login';
-        let loggedIn = false;
-        for (let intento = 1; intento <= 3 && !loggedIn; intento++) {
-            console.log(`[LOGIN] Intento ${intento}/3...`);
-            try {
-                loggedIn = await intentarLogin(page, browser, usuario, password);
-                if (!loggedIn) {
-                    console.log(`[LOGIN] Intento ${intento} falló (captcha incorrecto), reintentando...`);
-                }
-            } catch(e) {
-                console.log(`[LOGIN] Intento ${intento} error: ${e.message}`);
-            }
-        }
-
-        if (!loggedIn) {
+        if (!await loginConRetry(page, browser, usuario, password)) {
             await browser.close();
-            return res.json({ success: false, error: true, mensaje: 'Login falló después de 3 intentos de captcha' });
+            return res.json({ success: false, error: true, mensaje: 'Login falló después de 3 intentos' });
         }
+        console.log('[LOGIN] ✅');
 
-        console.log('[LOGIN] ✅ ¡Sistema cargado!');
+        paso = 'Tab Personas';
+        const { dniFrame, dniSelector } = await irAPersonas(page);
+        if (!dniFrame) { await browser.close(); return res.json({ success: false, error: true, mensaje: 'Sin input DNI' }); }
 
-        // ── BUSCAR PERSONA ──
-        paso = 'Buscar persona';
-        await sleep(5000);
+        paso = 'Buscar DNI';
+        const { grillaHtml, grillaFrame } = await buscarDNI(page, dniFrame, dniSelector, dniLimpio);
+        console.log(`[BUSCAR] Grilla: ${grillaHtml.length}c`);
 
-        console.log(`[7] Frames: ${page.frames().map(f => f.name() + '=' + f.url().split('/').pop()).join(', ')}`);
+        if (!grillaHtml || grillaHtml.length < 100)
+            { await browser.close(); return res.json({ success: false, error: true, mensaje: 'Grilla vacía' }); }
+        if (/no se encontr|0 registro|sin resultado/i.test(grillaHtml))
+            { await browser.close(); return res.json({ success: true, noRegistra: true, cupoMaximo: 0 }); }
 
-        const tabResult = await page.evaluate(() => {
-            try { if (typeof Tab_Click === 'function') { Tab_Click('Personas'); return 'OK'; } return 'no fn'; } catch(e) { return e.message; }
-        });
-        console.log(`[7] Tab_Click: ${tabResult}`);
-        await sleep(8000);
+        paso = 'Parsear grilla';
+        const legajos = parsearGrilla(grillaHtml);
+        console.log(`[GRILLA] ${legajos.length} legajos: ${JSON.stringify(legajos.map(l => ({ n: l.nombre, socio: l.esSocio })))}`);
+        if (legajos.length === 0) { await browser.close(); return res.json({ success: true, noRegistra: true, cupoMaximo: 0 }); }
 
-        console.log(`[7] Frames post-tab: ${page.frames().map(f => f.name() + '=' + f.url().split('/').pop()).join(', ')}`);
+        const legajo = legajos[0];
+        let afiliadoAhora = false;
 
-        // Buscar input DNI — el campo es Per_NroDoc en el frame iPersonas
-        let dniFrame = null, dniSelector = null;
-        const selectors = [
-            'input[name="Per_NroDoc"]', 'input[name="dni"]', 'input[name="Documento"]',
-            'input[name="nroDocumento"]', 'input[name="nro_doc"]',
-        ];
+        // ── Si no es socio → afiliar ──
+        if (!legajo.esSocio) {
+            paso = 'Afiliar persona';
+            console.log(`[AFILIACION] Socio=NO, iniciando afiliación...`);
+            await abrirPropiedades(page, grillaFrame, legajo.index);
+            await afiliarPersona(page);
+            afiliadoAhora = true;
 
-        // Buscar primero en iPersonas específicamente
-        const iPersonas = page.frames().find(f => f.name() === 'iPersonas');
-        if (iPersonas) {
-            for (const sel of selectors) {
-                if (await iPersonas.$(sel).catch(() => null)) { dniFrame = iPersonas; dniSelector = sel; break; }
-            }
-        }
-
-        // Fallback: buscar en todos los frames
-        if (!dniFrame) {
-            for (let i = 0; i < 5 && !dniFrame; i++) {
-                for (const f of page.frames()) {
-                    for (const sel of selectors) {
-                        if (await f.$(sel).catch(() => null)) { dniFrame = f; dniSelector = sel; break; }
-                    }
-                    if (dniFrame) break;
-                }
-                if (!dniFrame) await sleep(3000);
-            }
-        }
-
-        if (!dniFrame) {
-            // Log HTML de frames de personas específicamente
-            for (const name of ['iPersonas', 'ifrComandosPersonas', 'ifrGrillaPersonas', 'ifrDetallePersonas']) {
-                const f = page.frames().find(f => f.name() === name);
-                if (f) {
-                    const h = await f.content().catch(() => '');
-                    console.log(`[7] ${name} (${h.length}c): ${h.substring(0, 500)}`);
+            // Re-buscar para refrescar grilla con Socio=SI
+            paso = 'Re-buscar post-afiliacion';
+            const { dniFrame: df2, dniSelector: ds2 } = await irAPersonas(page);
+            if (df2) {
+                const { grillaHtml: gh2, grillaFrame: gf2 } = await buscarDNI(page, df2, ds2, dniLimpio);
+                const legajos2 = parsearGrilla(gh2);
+                if (legajos2.length > 0) {
+                    Object.assign(legajo, legajos2[0]);
+                    Object.assign(grillaFrame || {}, gf2 || {});
                 }
             }
-            await browser.close();
-            return res.json({ success: false, error: true, mensaje: 'Sin input DNI' });
         }
 
-        console.log(`[7] ✓ DNI: ${dniSelector} en ${dniFrame.name()}`);
+        // ── Click legajo → Alta ──
+        paso = 'Click legajo';
+        await clickLegajo(page, grillaFrame, legajo.index);
 
-        // Limpiar y escribir DNI
-        await dniFrame.evaluate((sel) => { const el = document.querySelector(sel); if (el) { el.value = ''; el.focus(); } }, dniSelector);
-        await dniFrame.type(dniSelector, dniLimpio, { delay: 50 });
-        console.log(`[7] DNI ingresado: ${dniLimpio}`);
+        paso = 'Click Alta crédito';
+        await clickAltaCredito(page);
 
-        // Click en Buscar — usar evaluate para llamar la función o submit del form
-        await dniFrame.evaluate(() => {
-            try {
-                if (typeof Buscar === 'function') { Buscar(); return; }
-                if (typeof Aceptar === 'function') { Aceptar(); return; }
-                const form = document.getElementById('form1') || document.forms[0];
-                if (form) {
-                    const modo = document.getElementById('Modo');
-                    if (modo) modo.value = 'Buscar';
-                    form.submit();
-                }
-            } catch(e) { console.log('Submit error:', e.message); }
-        });
+        // ── Binary search ──
+        paso = 'Binary search cupo';
+        const { cupoMaximo, iteraciones } = await binarySearchCupo(page, min, max);
+        console.log(`[CUPO] ✅ cupoMaximo=${cupoMaximo} iteraciones=${iteraciones} afiliadoAhora=${afiliadoAhora}`);
 
-        // Esperar resultado
-        await sleep(8000);
-
-        // Verificar resultado en la grilla
-        const grillaFrame = page.frames().find(f => f.name() === 'ifrGrillaPersonas');
-        if (grillaFrame) {
-            const grillaHtml = await grillaFrame.content().catch(() => '');
-            console.log(`[7] Grilla: ${grillaHtml.length}c snippet: ${grillaHtml.substring(0, 200)}`);
-            const noResultados = grillaHtml.includes('no se encontraron') || grillaHtml.includes('0 registro');
-            if (noResultados) {
-                await browser.close();
-                return res.json({ success: true, noRegistra: true, cupoMaximo: 0 });
-            }
-        }
-
-        const body = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
-        if (body.includes("No se encontraron") || body.includes("no se encontraron") || body.includes("0 registro")) {
-            await browser.close();
-            return res.json({ success: true, noRegistra: true, cupoMaximo: 0 });
-        }
-
-        console.log('[7] Persona encontrada, continuando...');
-        // TODO: Click en la persona de la grilla, luego Alta, luego búsqueda binaria
-        // Por ahora retornamos éxito parcial para confirmar que el flujo funciona
         await browser.close();
-        return res.json({ success: true, mensaje: '¡LOGIN + BÚSQUEDA EXITOSA! Persona encontrada.', paso: 'persona_encontrada', dni: dniLimpio });
+        return res.json({
+            success: true,
+            cupoMaximo,
+            iteraciones,
+            nombre: legajo.nombre,
+            afiliadoAhora,     // el dashboard usa esto para saber que si el crédito no prospera hay que dar de baja
+            legajosEncontrados: legajos.length,
+        });
 
     } catch (err) {
         console.error(`[ERROR] ${paso}: ${err.message}`);
@@ -372,8 +648,136 @@ app.post('/api/simular-cupo', async (req, res) => {
     }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', version: '10' }));
-app.get('/api/status', (req, res) => res.json({ ok: true, version: '10' }));
+// ============================================================
+// 4. EJECUTAR ALTA REAL
+// ============================================================
+app.post('/api/ejecutar-alta', async (req, res) => {
+    let { dni, usuario, password, sexo, montoCuota } = req.body;
+    if (!dni || !usuario || !password || !montoCuota)
+        return res.json({ success: false, error: true, mensaje: 'Faltan: dni, usuario, password, montoCuota' });
+    const dniLimpio = dni.length > 8 ? dni.substring(2, dni.length - 1) : dni;
+    let browser, paso = 'Iniciando';
+
+    try {
+        console.log(`\n${'='.repeat(60)}`);
+        console.log(`[ALTA REAL v12] DNI=${dniLimpio} monto=${montoCuota}`);
+        browser = await launchBrowser();
+        const page = await browser.newPage();
+        await configurarPagina(page);
+
+        paso = 'Login';
+        if (!await loginConRetry(page, browser, usuario, password)) {
+            await browser.close(); return res.json({ success: false, error: true, mensaje: 'Login falló' });
+        }
+
+        paso = 'Tab Personas';
+        const { dniFrame, dniSelector } = await irAPersonas(page);
+        if (!dniFrame) { await browser.close(); return res.json({ success: false, error: true, mensaje: 'Sin input DNI' }); }
+
+        paso = 'Buscar DNI';
+        const { grillaHtml, grillaFrame } = await buscarDNI(page, dniFrame, dniSelector, dniLimpio);
+        if (!grillaHtml || /no se encontr|0 registro/i.test(grillaHtml))
+            { await browser.close(); return res.json({ success: false, error: true, mensaje: 'Persona no encontrada' }); }
+
+        const legajos = parsearGrilla(grillaHtml);
+        if (legajos.length === 0) { await browser.close(); return res.json({ success: false, error: true, mensaje: 'Sin legajos' }); }
+        const legajo = legajos[0];
+
+        paso = 'Click legajo';
+        await clickLegajo(page, grillaFrame, legajo.index);
+
+        paso = 'Click Alta crédito';
+        await clickAltaCredito(page);
+
+        paso = 'Ingresar monto y confirmar';
+        for (const f of page.frames()) {
+            const ok = await f.evaluate((m) => {
+                const input = document.querySelector('input[name="importe_cuota"]') ||
+                              document.querySelector('input[name="monto"]') ||
+                              document.querySelector('input[name="Monto"]');
+                if (!input) return false;
+                input.value = m.toString();
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                const btns = Array.from(document.querySelectorAll('input[type="button"], button'));
+                const aceptar = btns.find(b => /^aceptar$/i.test((b.value || b.innerText || '').trim()));
+                if (aceptar) { aceptar.click(); return true; }
+                return false;
+            }, montoCuota).catch(() => false);
+            if (ok) break;
+        }
+        await sleep(6000);
+
+        // Capturar código CAD
+        let codigoCAD = '';
+        for (const f of page.frames()) {
+            const cad = await f.evaluate(() => {
+                const body = document.body?.innerText || '';
+                const match = body.match(/CAD[:\s#]*([A-Z0-9-]{4,20})/i) ||
+                              body.match(/[Cc][óo]digo[:\s]*([A-Z0-9-]{4,20})/);
+                return match ? match[1] : '';
+            }).catch(() => '');
+            if (cad) { codigoCAD = cad; break; }
+        }
+
+        const screenshotB64 = await page.screenshot({ encoding: 'base64', fullPage: false }).catch(() => '');
+        console.log(`[ALTA REAL] ✅ CAD=${codigoCAD}`);
+        await browser.close();
+        return res.json({ success: true, codigoCAD, screenshotBase64: screenshotB64, nombre: legajo.nombre });
+
+    } catch (err) {
+        console.error(`[ERROR ALTA] ${paso}: ${err.message}`);
+        if (browser) await browser.close().catch(() => {});
+        return res.json({ success: false, error: true, mensaje: `Paso: ${paso} — ${err.message}` });
+    }
+});
+
+// ============================================================
+// 5. BAJA AFILIADO (cuando el crédito no prospera)
+// ============================================================
+app.post('/api/baja-afiliado', async (req, res) => {
+    let { dni, usuario, password } = req.body;
+    if (!dni || !usuario || !password)
+        return res.json({ success: false, error: true, mensaje: 'Faltan: dni, usuario, password' });
+    const dniLimpio = dni.length > 8 ? dni.substring(2, dni.length - 1) : dni;
+    let browser, paso = 'Iniciando';
+
+    try {
+        console.log(`\n${'='.repeat(60)}`);
+        console.log(`[BAJA AFILIADO v12] DNI=${dniLimpio}`);
+        browser = await launchBrowser();
+        const page = await browser.newPage();
+        await configurarPagina(page);
+
+        paso = 'Login';
+        if (!await loginConRetry(page, browser, usuario, password)) {
+            await browser.close(); return res.json({ success: false, error: true, mensaje: 'Login falló' });
+        }
+
+        paso = 'Tab Personas';
+        const { dniFrame, dniSelector } = await irAPersonas(page);
+        if (!dniFrame) { await browser.close(); return res.json({ success: false, error: true, mensaje: 'Sin input DNI' }); }
+
+        paso = 'Buscar DNI';
+        const { grillaHtml, grillaFrame } = await buscarDNI(page, dniFrame, dniSelector, dniLimpio);
+        const legajos = parsearGrilla(grillaHtml);
+        if (legajos.length === 0) { await browser.close(); return res.json({ success: false, error: true, mensaje: 'Persona no encontrada' }); }
+
+        paso = 'Baja afiliado';
+        await bajaAfiliado(page, grillaFrame, legajos[0].index);
+
+        console.log('[BAJA AFILIADO] ✅');
+        await browser.close();
+        return res.json({ success: true, nombre: legajos[0].nombre });
+
+    } catch (err) {
+        console.error(`[ERROR BAJA] ${paso}: ${err.message}`);
+        if (browser) await browser.close().catch(() => {});
+        return res.json({ success: false, error: true, mensaje: `Paso: ${paso} — ${err.message}` });
+    }
+});
+
+app.get('/', (req, res) => res.json({ status: 'ok', version: '12' }));
+app.get('/api/status', (req, res) => res.json({ ok: true, version: '12' }));
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🤖 Bot v10 — captcha retry + interceptación — Puerto ${PORT}`));
+app.listen(PORT, () => console.log(`🤖 Bot v12 — afiliación automática — Puerto ${PORT}`));
